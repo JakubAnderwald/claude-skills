@@ -36,17 +36,19 @@ Follow these steps precisely. Do NOT skip the polling loop.
 
 Enter a loop. On each iteration:
 
-### 4a. Check CI/CD status
+### 4a. Check ALL checks status (CI + review bots)
 
 Run:
 ```bash
-gh pr checks --json name,state,conclusion --jq '.[] | [.name, .state, .conclusion] | @tsv'
+gh pr checks --json name,state --jq '.[] | [.name, .state] | @tsv'
 ```
 
-Classify the results:
-- **All checks passed** (every conclusion is `SUCCESS` or `SKIPPED`): CI is green.
-- **Any check failed** (conclusion is `FAILURE` or `CANCELLED`): CI has failures.
-- **Any check still pending** (state is `PENDING` or `QUEUED` or `IN_PROGRESS`): CI is still running.
+Classify the results across **all** checks — both CI jobs and review bots (e.g., CodeRabbit, SonarCloud):
+- **All checks passed** (every state is `SUCCESS` or `SKIPPED`): all checks are green.
+- **Any check failed** (state is `FAILURE` or `CANCELLED`): there are failures.
+- **Any check still pending** (state is `PENDING` or `QUEUED` or `IN_PROGRESS`): checks are still running.
+
+**CRITICAL:** Do NOT ignore pending non-CI checks. Review bots like CodeRabbit may post new comments after they finish. You must wait for ALL checks to complete before declaring "Done" — otherwise you risk merging before a reviewer has finished and potentially missing new feedback.
 
 ### 4b. Check review and PR comments
 
@@ -87,12 +89,14 @@ gh api repos/{owner}/{repo}/pulls/{number}/reviews --jq '
 
 ### 4c. Decide what to do
 
-| CI Status | Unresolved/Unanswered Comments | Action |
-|-----------|--------------------------------|--------|
-| Still running | Any | Wait 30 seconds, then poll again |
-| Green | None | Verify conversations resolved (Step 4f), then go to Step 5 |
-| Green | Yes | Address comments (Step 4d), then push and re-poll |
-| Failed | Any | Fix CI failures (Step 4e), then push and re-poll |
+| All Checks Status | Unresolved/Unanswered Comments | Action |
+|-------------------|--------------------------------|--------|
+| Any still running | Any | Wait 30 seconds, then poll again (Step 4g) |
+| All green | None | Verify conversations resolved (Step 4f), then go to Step 5 |
+| All green | Yes | Address comments (Step 4d), then push and re-poll |
+| Any failed | Any | Fix failures (Step 4e), then push and re-poll |
+
+**IMPORTANT:** "Any still running" means ANY check — including review bots like CodeRabbit. Never proceed to Step 5 while a review bot is still running. It may post new comments that need to be addressed.
 
 ### 4d. Address review comments
 
