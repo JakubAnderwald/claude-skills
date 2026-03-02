@@ -50,31 +50,47 @@ Classify the results:
 
 ### 4b. Check review and PR comments
 
+**IMPORTANT:** Use JSON output (not TSV) to avoid parsing issues with multi-line markdown bodies.
+
 Run these commands to fetch BOTH line-level review comments and general PR comments:
 
-1. **Get line-level review comments:**
+1. **Get line-level review comments (with reply counts):**
 ```bash
-gh api repos/{owner}/{repo}/pulls/{number}/comments --jq '.[] | [.id, "Line Comment", .body, .user.login] | @tsv' > pr_comments.tsv
+gh api repos/{owner}/{repo}/pulls/{number}/comments --jq '
+  [.[] | {id, type: "line", login: .user.login, path, line: (.line // .original_line),
+           subject: (.body | split("\n")[0] | .[0:120]),
+           has_replies: (if .in_reply_to_id then true else false end)}]
+  | [.[] | select(.has_replies == false)]' > pr_comments.json
 ```
+
+This filters to only **top-level comments without replies** (i.e., unresolved threads).
 
 2. **Get general PR comments:**
 ```bash
-gh api repos/{owner}/{repo}/issues/{number}/comments --jq '.[] | [.id, "General Comment", .body, .user.login] | @tsv' >> pr_comments.tsv
+gh api repos/{owner}/{repo}/issues/{number}/comments --jq '
+  [.[] | {id, type: "general", login: .user.login,
+           subject: (.body | split("\n")[0] | .[0:120])}]' >> pr_comments.json
 ```
 
-3. **Check for PR-level reviews requesting changes:**
+3. **Check for PR-level reviews requesting changes or containing actionable comments:**
 ```bash
-gh pr review list --json author,state --jq '.[] | select(.state == "CHANGES_REQUESTED") | [.author.login, .state] | @tsv'
+gh api repos/{owner}/{repo}/pulls/{number}/reviews --jq '
+  [.[] | select(.state == "CHANGES_REQUESTED" or (.state == "COMMENTED" and (.body | length) > 0))
+   | {login: .user.login, state}]'
 ```
 
-*Crucial Step:* Analyze `pr_comments.tsv`. Ignore any comments authored by yourself (or Claude). Identify any comments from reviewers that you have not yet explicitly addressed or replied to in this loop.
+*Crucial Step:* Analyze `pr_comments.json`. Apply these filters:
+- **Ignore** comments authored by yourself, Claude, `github-actions[bot]`, or `vercel[bot]`
+- **Include** comments from all other reviewers (human or bot reviewers like `coderabbitai[bot]`)
+- A comment is **unresolved** if it is a top-level comment with no reply from you in this loop
+- Count the number of unresolved comments to decide next action
 
 ### 4c. Decide what to do
 
 | CI Status | Unresolved/Unanswered Comments | Action |
 |-----------|--------------------------------|--------|
 | Still running | Any | Wait 30 seconds, then poll again |
-| Green | None | **Done!** Go to Step 5 |
+| Green | None | Verify conversations resolved (Step 4f), then go to Step 5 |
 | Green | Yes | Address comments (Step 4d), then push and re-poll |
 | Failed | Any | Fix CI failures (Step 4e), then push and re-poll |
 
@@ -112,7 +128,34 @@ For EACH unresolved or unanswered comment identified in Step 4b:
 4. Stage, commit (with a message like "fix: resolve CI failure in <check name>"), and push.
 5. Return to the top of the polling loop (Step 4).
 
-### 4f. Wait between polls
+### 4f. Verify all conversations are resolved
+
+Before declaring "Done", confirm that the PR can actually be merged by checking for unresolved conversations (repos with `required_conversation_resolution` branch protection will block merge otherwise):
+
+1. **Count unresolved review threads:**
+```bash
+gh api repos/{owner}/{repo}/pulls/{number}/comments --jq '
+  [.[] | select(.in_reply_to_id == null)] |
+  [.[] | .id] as $top_ids |
+  ($top_ids | length) as $total |
+  [.[] | select(.in_reply_to_id != null) | .in_reply_to_id] | unique | length |
+  . as $replied |
+  ($total - $replied)'
+```
+
+Actually, use a simpler approach — check each top-level comment has at least one reply:
+```bash
+# Get all top-level comment IDs
+TOP_IDS=$(gh api repos/{owner}/{repo}/pulls/{number}/comments --jq '[.[] | select(.in_reply_to_id == null) | .id]')
+# Get all reply-to IDs
+REPLY_IDS=$(gh api repos/{owner}/{repo}/pulls/{number}/comments --jq '[.[] | select(.in_reply_to_id != null) | .in_reply_to_id] | unique')
+```
+
+Compare: any ID in `TOP_IDS` not present in `REPLY_IDS` is an unresolved conversation. If unresolved conversations remain, go back to Step 4d to reply to them.
+
+2. If all conversations are resolved, proceed to Step 5.
+
+### 4g. Wait between polls
 
 If CI is still running, wait 30 seconds before the next iteration:
 ```bash
