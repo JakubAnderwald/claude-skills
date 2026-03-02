@@ -48,22 +48,31 @@ Classify the results:
 - **Any check failed** (conclusion is `FAILURE` or `CANCELLED`): CI has failures.
 - **Any check still pending** (state is `PENDING` or `QUEUED` or `IN_PROGRESS`): CI is still running.
 
-### 4b. Check review comments
+### 4b. Check review and PR comments
 
-Run:
+Run these commands to fetch BOTH line-level review comments and general PR comments:
+
+1. **Get line-level review comments:**
 ```bash
-gh api repos/{owner}/{repo}/pulls/{number}/comments --jq '.[] | select(.position != null) | [.id, .path, .body, .user.login] | @tsv'
+gh api repos/{owner}/{repo}/pulls/{number}/comments --jq '.[] | [.id, "Line Comment", .body, .user.login] | @tsv' > pr_comments.tsv
 ```
 
-Also check for PR-level reviews requesting changes:
+2. **Get general PR comments:**
+```bash
+gh api repos/{owner}/{repo}/issues/{number}/comments --jq '.[] | [.id, "General Comment", .body, .user.login] | @tsv' >> pr_comments.tsv
+```
+
+3. **Check for PR-level reviews requesting changes:**
 ```bash
 gh pr review list --json author,state --jq '.[] | select(.state == "CHANGES_REQUESTED") | [.author.login, .state] | @tsv'
 ```
 
+*Crucial Step:* Analyze `pr_comments.tsv`. Ignore any comments authored by yourself (or Claude). Identify any comments from reviewers that you have not yet explicitly addressed or replied to in this loop.
+
 ### 4c. Decide what to do
 
-| CI Status | Unresolved Comments | Action |
-|-----------|-------------------|--------|
+| CI Status | Unresolved/Unanswered Comments | Action |
+|-----------|--------------------------------|--------|
 | Still running | Any | Wait 30 seconds, then poll again |
 | Green | None | **Done!** Go to Step 5 |
 | Green | Yes | Address comments (Step 4d), then push and re-poll |
@@ -71,14 +80,22 @@ gh pr review list --json author,state --jq '.[] | select(.state == "CHANGES_REQU
 
 ### 4d. Address review comments
 
-For each unresolved review comment:
-1. Read the referenced file and understand the comment.
-2. If the fix is clear, make the change.
-3. If the fix is ambiguous or involves a design decision, ask the user using AskUserQuestion.
-4. After fixing, reply to the comment on GitHub explaining what was changed:
+For EACH unresolved or unanswered comment identified in Step 4b:
+1. Read the referenced file/context and understand the comment.
+2. If the fix is clear, make the change in the code.
+3. If the fix is ambiguous, involves a design decision, or requires clarification, ask the user using `AskUserQuestion`.
+4. **Mandatory Reply:** After fixing the code or deciding on an action, you MUST reply to the comment on GitHub so it is marked as addressed.
+   
+   *For Line Comments (from the pulls API):*
    ```bash
-   gh api repos/{owner}/{repo}/pulls/{number}/comments/{comment_id}/replies -f body="Fixed: <brief explanation>"
+   gh api repos/{owner}/{repo}/pulls/{number}/comments/{comment_id}/replies -f body="Fixed: <brief explanation of what you did>"
    ```
+   
+   *For General PR Comments (from the issues API):*
+   ```bash
+   gh api repos/{owner}/{repo}/issues/{number}/comments -f body="> Reply to comment {comment_id}: Fixed: <brief explanation>"
+   ```
+5. Once all comments are addressed and replied to, commit the changes, push to the branch, and return to Step 4.
 
 ### 4e. Fix CI failures
 
