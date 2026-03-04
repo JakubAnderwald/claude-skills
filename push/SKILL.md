@@ -1,7 +1,6 @@
 ---
 name: push
 description: Commit all changes, push to remote, wait for CI/CD and review comments, and resolve any issues in a loop until everything passes.
-disable-model-invocation: true
 allowed-tools: Bash, Read, Grep, Glob, Edit, Write
 user-invocable: true
 ---
