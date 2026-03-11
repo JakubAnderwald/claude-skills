@@ -14,9 +14,6 @@ Follow these steps precisely. Do NOT skip the polling loop.
 1. Run `git status` and `git diff` to review all pending changes (staged and unstaged).
 2. Stage all changes: `git add -A`.
 3. Create a commit with a concise, descriptive message summarizing the changes. Use conventional-commit style if the repo already uses it. End the commit message with:
-   ```
-   Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
-   ```
 4. If there are no changes to commit, inform the user and skip to Step 3 (push only if there are unpushed commits).
 
 ## Step 2: Push
@@ -136,17 +133,7 @@ For EACH unresolved or unanswered comment identified in Step 4b:
 Before declaring "Done", confirm that the PR can actually be merged by checking for unresolved conversations (repos with `required_conversation_resolution` branch protection will block merge otherwise):
 
 1. **Count unresolved review threads:**
-```bash
-gh api repos/{owner}/{repo}/pulls/{number}/comments --jq '
-  [.[] | select(.in_reply_to_id == null)] |
-  [.[] | .id] as $top_ids |
-  ($top_ids | length) as $total |
-  [.[] | select(.in_reply_to_id != null) | .in_reply_to_id] | unique | length |
-  . as $replied |
-  ($total - $replied)'
-```
-
-Actually, use a simpler approach — check each top-level comment has at least one reply:
+Check each top-level comment has at least one reply:
 ```bash
 # Get all top-level comment IDs
 TOP_IDS=$(gh api repos/{owner}/{repo}/pulls/{number}/comments --jq '[.[] | select(.in_reply_to_id == null) | .id]')
