@@ -46,7 +46,9 @@ Classify the results across **all** checks — both CI jobs and review bots (e.g
 
 **CRITICAL:** Do NOT ignore pending non-CI checks. Review bots like CodeRabbit may post new comments after they finish. You must wait for ALL checks to complete before declaring "Done" — otherwise you risk merging before a reviewer has finished and potentially missing new feedback.
 
-### 4b. Check review and PR comments
+### 4b. Check review and PR comments (EVERY iteration)
+
+**IMPORTANT:** You MUST fetch comments on EVERY poll iteration, not just when all checks are green. Review bots frequently post comments while their check status is still PENDING. If you skip fetching comments while waiting for checks, you waste time that could be spent addressing already-posted feedback.
 
 **IMPORTANT:** Use JSON output (not TSV) to avoid parsing issues with multi-line markdown bodies.
 
@@ -87,12 +89,17 @@ gh api repos/{owner}/{repo}/pulls/{number}/reviews --jq '
 
 | All Checks Status | Unresolved/Unanswered Comments | Action |
 |-------------------|--------------------------------|--------|
-| Any still running | Any | Wait 30 seconds, then poll again (Step 4g) |
-| All green | None | Verify conversations resolved (Step 4f), then go to Step 5 |
+| Any still running | **Yes** | Address comments immediately (Step 4d), then continue polling — do NOT wait idle when there is work to do |
+| Any still running | None | Wait 30 seconds, then poll again (Step 4g) |
+| All green | None | Pass the Critical Gate (Step 4f-gate), verify conversations resolved (Step 4f), then go to Step 5 |
 | All green | Yes | Address comments (Step 4d), then push and re-poll |
 | Any failed | Any | Fix failures (Step 4e), then push and re-poll |
 
-**IMPORTANT:** "Any still running" means ANY check — including review bots like CodeRabbit. Never proceed to Step 5 while a review bot is still running. It may post new comments that need to be addressed.
+**Stuck PENDING check handling:** Track how many consecutive polls each check has been in PENDING/QUEUED state. If a non-CI check (e.g., CodeRabbit, SonarCloud review) has been PENDING for more than **10 consecutive polls (~5 minutes)** AND it has already posted at least one comment, treat that check as effectively complete for decision-making purposes. Review bots often post all their comments well before their check status flips to SUCCESS. If **all other checks** are SUCCESS/SKIPPED and you have already fetched and addressed all comments from the stuck check, reclassify the stuck check as green and proceed accordingly using this table.
+
+Additionally, if the **same check** has been PENDING for more than **10 consecutive polls** and **all other checks** are SUCCESS/SKIPPED and **all comments have been addressed**, treat the stuck check as complete and proceed to the Critical Gate (Step 4f-gate).
+
+**IMPORTANT:** "Any still running" means ANY check — including review bots like CodeRabbit. However, do NOT sit idle while waiting for checks if there are already unresolved comments posted. Address those comments immediately while CI continues to run.
 
 ### 4d. Address review comments
 
@@ -127,6 +134,17 @@ For EACH unresolved or unanswered comment identified in Step 4b:
 3. Fix the issue in the code.
 4. Stage, commit (with a message like "fix: resolve CI failure in <check name>"), and push.
 5. Return to the top of the polling loop (Step 4).
+
+### 4f-gate. CRITICAL GATE — Must pass before Step 5
+
+**This gate cannot be skipped under any circumstances.**
+
+Before proceeding to Step 4f or Step 5, you MUST:
+
+1. **Fetch ALL line-level review comments one final time** using the same commands from Step 4b. Do not rely on cached results — new comments may have arrived since your last fetch.
+2. **Verify every top-level comment has been replied to** by you (excluding comments from yourself, Claude, `github-actions[bot]`, or `vercel[bot]`).
+3. **If ANY unreplied comment exists from a non-ignored author**, go back to Step 4d to address it. Do NOT proceed.
+4. Only after confirming zero unreplied comments, continue to Step 4f.
 
 ### 4f. Verify all conversations are resolved
 
