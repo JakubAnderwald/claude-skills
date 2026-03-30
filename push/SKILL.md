@@ -95,11 +95,7 @@ gh api repos/{owner}/{repo}/pulls/{number}/reviews --jq '
 | All green | Yes | Address comments (Step 4d), then push and re-poll |
 | Any failed | Any | Fix failures (Step 4e), then push and re-poll |
 
-**Stuck PENDING check handling:** Track how many consecutive polls each check has been in PENDING/QUEUED state. If a non-CI check (e.g., CodeRabbit, SonarCloud review) has been PENDING for more than **10 consecutive polls (~5 minutes)** AND it has already posted at least one comment, treat that check as effectively complete for decision-making purposes. Review bots often post all their comments well before their check status flips to SUCCESS. If **all other checks** are SUCCESS/SKIPPED and you have already fetched and addressed all comments from the stuck check, reclassify the stuck check as green and proceed accordingly using this table.
-
-Additionally, if the **same check** has been PENDING for more than **10 consecutive polls** and **all other checks** are SUCCESS/SKIPPED and **all comments have been addressed**, treat the stuck check as complete and proceed to the Critical Gate (Step 4f-gate).
-
-**IMPORTANT:** "Any still running" means ANY check — including review bots like CodeRabbit. However, do NOT sit idle while waiting for checks if there are already unresolved comments posted. Address those comments immediately while CI continues to run.
+**IMPORTANT:** "Any still running" means ANY check — including review bots like CodeRabbit. Never treat a PENDING check as complete just because it has been pending for a long time. Always wait for every check to reach a terminal state (SUCCESS, FAILURE, CANCELLED, or SKIPPED). However, do NOT sit idle while waiting for checks if there are already unresolved comments posted. Address those comments immediately while CI continues to run.
 
 ### 4d. Address review comments
 
