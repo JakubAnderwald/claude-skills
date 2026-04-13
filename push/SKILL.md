@@ -85,6 +85,21 @@ gh api repos/{owner}/{repo}/pulls/{number}/reviews --jq '
 - A comment is **unresolved** if it is a top-level comment with no reply from you in this loop
 - Count the number of unresolved comments to decide next action
 
+4. **Check for reviewer follow-up replies (CRITICAL — easy to miss):**
+
+Review bots often reply to YOUR reply with follow-up concerns or confirmations. These follow-ups are NOT top-level comments — they are replies themselves. You must also check for threads where a reviewer's message is the LAST in the chain:
+
+```bash
+gh api repos/{owner}/{repo}/pulls/{number}/comments --jq '
+  [group_by(.in_reply_to_id // .id)[] |
+   sort_by(.created_at) | last |
+   select(.user.login != "github-actions[bot]" and .user.login != "vercel[bot]") |
+   {id, login: .user.login, subject: (.body | split("\n")[0] | .[0:120])}] |
+  [.[] | select(.login != "<your-github-login>")]'
+```
+
+Any thread where a reviewer (not you) posted the last message needs your reply.
+
 ### 4c. Decide what to do
 
 | All Checks Status | Unresolved/Unanswered Comments | Action |
@@ -139,25 +154,64 @@ Before proceeding to Step 4f or Step 5, you MUST:
 
 1. **Fetch ALL line-level review comments one final time** using the same commands from Step 4b. Do not rely on cached results — new comments may have arrived since your last fetch.
 2. **Verify every top-level comment has been replied to** by you (excluding comments from yourself, Claude, `github-actions[bot]`, or `vercel[bot]`).
-3. **If ANY unreplied comment exists from a non-ignored author**, go back to Step 4d to address it. Do NOT proceed.
-4. Only after confirming zero unreplied comments, continue to Step 4f.
+3. **Verify every reviewer follow-up has been replied to.** Check that YOU are the last commenter in every thread. Review bots frequently reply to your reply — you must address their follow-up before the thread can be resolved.
+4. **If ANY unreplied comment exists from a non-ignored author** (whether top-level OR follow-up), go back to Step 4d to address it. Do NOT proceed.
+5. Only after confirming zero unreplied comments across all threads, continue to Step 4f.
 
-### 4f. Verify all conversations are resolved
+### 4f. Verify all conversations are resolved AND resolve them on GitHub
 
-Before declaring "Done", confirm that the PR can actually be merged by checking for unresolved conversations (repos with `required_conversation_resolution` branch protection will block merge otherwise):
+Before declaring "Done", confirm that the PR can actually be merged. **Replying to a comment does NOT resolve the GitHub conversation thread.** You must explicitly resolve each thread via the GraphQL API.
 
-1. **Count unresolved review threads:**
-Check each top-level comment has at least one reply:
+1. **Check for reviewer follow-up replies you haven't addressed:**
+
+Review bots (like CodeRabbit) often reply to YOUR reply with follow-up questions or confirmations. These follow-ups need your response too. Check for any comment from a non-ignored author that is the LAST message in its thread and has no reply from you after it:
+
 ```bash
-# Get all top-level comment IDs
-TOP_IDS=$(gh api repos/{owner}/{repo}/pulls/{number}/comments --jq '[.[] | select(.in_reply_to_id == null) | .id]')
-# Get all reply-to IDs
-REPLY_IDS=$(gh api repos/{owner}/{repo}/pulls/{number}/comments --jq '[.[] | select(.in_reply_to_id != null) | .in_reply_to_id] | unique')
+# Get the full comment chain to identify threads where a reviewer spoke last
+gh api repos/{owner}/{repo}/pulls/{number}/comments --jq '
+  [.[] | {id, in_reply_to_id, login: .user.login}]'
 ```
 
-Compare: any ID in `TOP_IDS` not present in `REPLY_IDS` is an unresolved conversation. If unresolved conversations remain, go back to Step 4d to reply to them.
+For each thread, check if the last message is from a reviewer (not you). If so, reply to acknowledge or address it before proceeding.
 
-2. If all conversations are resolved, proceed to Step 5.
+2. **Resolve all review threads via GraphQL:**
+
+First, find unresolved threads:
+```bash
+gh api graphql -f query='{
+  repository(owner: "{owner}", name: "{repo}") {
+    pullRequest(number: {number}) {
+      reviewThreads(first: 50) {
+        nodes { id isResolved comments(first: 1) { nodes { body author { login } } } }
+      }
+    }
+  }
+}' --jq '.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false) | .id'
+```
+
+Then resolve each unresolved thread:
+```bash
+gh api graphql -f query='mutation { resolveReviewThread(input: {threadId: "<thread_id>"}) { thread { isResolved } } }'
+```
+
+**Do this for EVERY unresolved thread.** Do NOT proceed until all threads show `isResolved: true`.
+
+3. **Final verification:**
+```bash
+gh api graphql -f query='{
+  repository(owner: "{owner}", name: "{repo}") {
+    pullRequest(number: {number}) {
+      reviewThreads(first: 50) {
+        nodes { isResolved }
+      }
+    }
+  }
+}' --jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false)] | length'
+```
+
+This must return `0`. If not, go back and resolve the remaining threads.
+
+4. If all conversations are resolved, proceed to Step 5.
 
 ### 4g. Wait between polls
 
