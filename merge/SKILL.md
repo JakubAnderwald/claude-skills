@@ -63,22 +63,40 @@ If any review has `CHANGES_REQUESTED`, inform the user and stop.
 
 ## Step 3: Merge the PR
 
-Use the GitHub API to squash-merge (avoids the worktree issue where `gh pr merge --delete-branch` tries to checkout `main`):
+Use the GitHub API to squash-merge (avoids the worktree issue where `gh pr merge --delete-branch` tries to checkout `main`).
+
+**The merge endpoint is `PUT` — you MUST pass `--method PUT`.** `gh api` defaults to `POST` whenever a field (`-f`) is present, and `POST .../merge` returns **`404 Not Found`** — which looks like a transient error but is actually the wrong HTTP method hitting a route that doesn't exist. Never drop `--method PUT`, and never "simplify" it back to a plain `gh api ... -f`.
+
+**Capture the response and verify `"merged": true` before doing anything else:**
 
 ```bash
-gh api repos/{owner}/{repo}/pulls/{number}/merge -f merge_method=squash
+OWNER_REPO="{owner}/{repo}"; NUM={number}
+MERGE_JSON=$(gh api --method PUT "repos/$OWNER_REPO/pulls/$NUM/merge" -f merge_method=squash 2>&1)
+echo "$MERGE_JSON"
+MERGED=$(printf '%s' "$MERGE_JSON" | jq -r '.merged // false' 2>/dev/null)
+echo "merged=$MERGED"
 ```
 
-If the merge fails (e.g., merge conflicts, branch protection), inform the user with the error and stop.
+If `MERGED` is not exactly `true` — for ANY reason (404 wrong-method, 405 "not mergeable", 409 head-changed, branch protection, conflicts) — **STOP IMMEDIATELY.** Inform the user with the raw `$MERGE_JSON` and do **NOT** proceed to Step 4.
+
+> ⚠️ **Destructive-sequence guard:** deleting the branch of an *unmerged* PR makes GitHub **close the PR unmerged** and discards the remote ref. Step 4 (branch delete) and Step 5 (worktree/branch removal) are irreversible relative to the PR. Run them ONLY after you have seen `"merged": true` in this step. A failed merge means: fix the cause (or hand to the user) with the branch and PR fully intact — never clean up after a merge you did not confirm.
 
 ## Step 4: Delete the Remote Branch
 
-After a successful merge, delete the remote branch:
+**Precondition: Step 3 printed `merged=true`.** If it did not, you must not be here.
+
+As a final guard, re-confirm the PR is actually merged before deleting anything:
+```bash
+gh pr view {number} --json state,mergedAt --jq '"\(.state) \(.mergedAt)"'
+# Must print "MERGED <timestamp>". If it prints "CLOSED null" or "OPEN null", STOP — do not delete the branch.
+```
+
+Only once you have confirmed `MERGED` with a non-null timestamp, delete the remote branch:
 ```bash
 git push origin --delete $(git branch --show-current)
 ```
 
-If this fails (e.g., branch already deleted by GitHub), that's fine — continue.
+If this fails (e.g., GitHub auto-deleted it on merge), that's fine — continue.
 
 ## Step 5: Clean Up Local Worktree and Branch
 
