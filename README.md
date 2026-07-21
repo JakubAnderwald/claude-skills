@@ -8,7 +8,6 @@ Shared Claude Code skills, synced across machines via git.
 |-------|-------------|
 | `/push` | Commit, push, poll CI/CD & review comments, fix issues in a loop until green |
 | `/merge` | Merge current PR to main (CI green + comments resolved), clean up branch & worktree |
-| `/ralph-plan` | Planning assistant |
 | `/watch` | Watch a video (URL or local path): scene-change frames + transcript + structured report, a dense 0–10s hook microscope, and optional Obsidian auto-save |
 
 ## Setup on a new machine
