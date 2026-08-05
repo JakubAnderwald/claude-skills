@@ -8,7 +8,7 @@ Shared Claude Code skills, synced across machines via git.
 |-------|-------------|
 | `/push` | Commit, push, poll CI/CD & review comments, fix issues in a loop until green |
 | `/merge` | Merge current PR to main (CI green + comments resolved), clean up branch & worktree |
-| `/watch` | Watch a video (URL or local path): scene-change frames + transcript + structured report written in the video's own language and printed into the chat, a dense 0–10s hook microscope, and optional Obsidian auto-save |
+| `/watch` | Watch a video (URL or local path): scene-change frames + on-device transcript + a dense 0–10s hook microscope, into a structured report written in the video's own language and printed into the chat |
 
 ## Setup on a new machine
 
@@ -33,14 +33,26 @@ simply ignored (they have no `SKILL.md`).
 
 ## `/watch` prerequisites
 
-`/watch` shells out to local tooling. Before first use:
+`/watch` shells out to local tooling — **no API key, and nothing leaves the machine.** Transcription runs on-device via whisper.cpp. Before first use:
 
-- **`ffmpeg` + `yt-dlp`** — required. On macOS: `brew install ffmpeg yt-dlp`. The skill's `scripts/setup.py` will auto-install these on macOS/Homebrew and scaffold config; on Linux/Windows it prints the exact commands.
-- **Whisper API key (optional)** — `GROQ_API_KEY` (preferred) or `OPENAI_API_KEY` in `~/.config/watch/.env`, used only as a transcript fallback when a video has no native captions. (See also the local-Whisper option below.)
-- **Obsidian vault (optional)** — set `WATCH_VAULT_DIR` to auto-ingest reports; otherwise the report is left on disk and that step is skipped.
+- **`ffmpeg` + `yt-dlp` + `whisper-cpp`** — required. On macOS: `brew install ffmpeg yt-dlp whisper-cpp`.
+- **The `large-v3-q5_0` ggml model** (~1.1 GB) — required for videos without native captions, and for the hook microscope's word-level timings. Looked up via `$WATCH_WHISPER_MODEL`, then `~/code/whisper-transcribe/`, then `~/.config/watch/models/`.
 
-Run `python3 ~/.claude/skills/watch/scripts/setup.py` once to install deps and scaffold config.
+Run the installer once — it's idempotent, brew-installs the binaries on macOS, downloads the model if no copy is found, and prints the exact commands instead on Linux/Windows:
+
+```bash
+python3 ~/.claude/skills/watch/scripts/setup.py
+```
+
+Every `/watch` run silently preflights with `setup.py --check` (exit `2` = missing binaries, `3` = missing model, `4` = both), so a half-installed machine tells you what to fix instead of failing mid-watch.
+
+Optional environment variables:
+
+- `WATCH_WHISPER_MODEL` — path to an existing ggml model, if you keep one outside the search paths.
+- `WATCH_WHISPER_LANG` — default spoken language for whisper (`auto` by default; the report is written in whatever language is detected).
 
 ## Credits
 
 `/watch` is vendored from [taoufik123-collab/claude-watch](https://github.com/taoufik123-collab/claude-watch) (MIT), itself built on Bradley Bonanno's [claude-video](https://github.com/bradautomates/claude-video). See `watch/LICENSE` and `watch/AUTHORS.md`.
+
+This fork diverges from upstream in two ways: the cloud Whisper backends (Groq/OpenAI) were replaced with on-device whisper.cpp, and the Obsidian auto-save step was dropped — reports stay in the working directory and get printed into the chat.
