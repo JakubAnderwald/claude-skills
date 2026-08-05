@@ -38,10 +38,10 @@ def analyse_hook(
     lang: str = DEFAULT_LANG,
     transcribe_words: bool = True,
 ) -> dict:
-    """Run hook microscope. Returns {frames, words, segments, ran}."""
+    """Run hook microscope. Returns {frames, words, segments, language, ran}."""
     if full_video_duration > 0 and full_video_duration < 30.0:
-        return {"frames": [], "words": [], "segments": [], "ran": False,
-                "skipped_reason": "video <30s"}
+        return {"frames": [], "words": [], "segments": [], "language": None,
+                "ran": False, "skipped_reason": "video <30s"}
 
     out_dir.mkdir(parents=True, exist_ok=True)
     hook_frames_dir = out_dir / "hook_frames"
@@ -53,6 +53,7 @@ def analyse_hook(
 
     words: list[dict] = []
     segments: list[dict] = []
+    language: str | None = None
     if transcribe_words:
         try:
             model = resolve_model(model_path)
@@ -60,7 +61,7 @@ def analyse_hook(
                 video_path, out_dir / "hook_audio.wav",
                 duration=HOOK_DURATION_SECONDS,
             )
-            segments, words = transcribe_audio_local(
+            segments, words, language = transcribe_audio_local(
                 hook_audio, model, word_timestamps=True, lang=lang,
             )
         except WhisperLocalError as exc:
@@ -71,6 +72,7 @@ def analyse_hook(
         "frames": hook_frames,
         "words": words,
         "segments": segments,
+        "language": language,
         "ran": True,
     }
 

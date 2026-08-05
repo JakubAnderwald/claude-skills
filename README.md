@@ -8,7 +8,7 @@ Shared Claude Code skills, synced across machines via git.
 |-------|-------------|
 | `/push` | Commit, push, poll CI/CD & review comments, fix issues in a loop until green |
 | `/merge` | Merge current PR to main (CI green + comments resolved), clean up branch & worktree |
-| `/watch` | Watch a video (URL or local path): scene-change frames + transcript + structured report, a dense 0–10s hook microscope, and optional Obsidian auto-save |
+| `/watch` | Watch a video (URL or local path): scene-change frames + transcript + structured report written in the video's own language and printed into the chat, a dense 0–10s hook microscope, and optional Obsidian auto-save |
 
 ## Setup on a new machine
 

@@ -130,6 +130,20 @@ def _run_whisper(
         raise WhisperLocalError(f"could not parse whisper.cpp JSON at {json_path}: {exc}")
 
 
+def detected_language(data: dict) -> str | None:
+    """Language whisper.cpp decided the audio is in (`result.language`).
+
+    With `-l auto` this is a real detection, and it is the most trustworthy
+    answer to "what language is this video recorded in" — it listens to the
+    audio instead of trusting uploader metadata or a translated caption track.
+    """
+    lang = ((data.get("result") or {}).get("language") or "").strip().lower()
+    if lang in ("", "auto"):
+        # Older builds only echo the requested language back in params.
+        lang = ((data.get("params") or {}).get("language") or "").strip().lower()
+    return None if lang in ("", "auto") else lang
+
+
 def _rows(data: dict) -> list[tuple[str, float, float]]:
     """Yield (text, start_s, end_s) from whisper.cpp JSON transcription entries."""
     out: list[tuple[str, float, float]] = []
@@ -147,11 +161,13 @@ def _rows(data: dict) -> list[tuple[str, float, float]]:
 def transcribe_audio_local(
     audio_wav: Path, model: Path,
     word_timestamps: bool = False, lang: str = DEFAULT_LANG,
-) -> tuple[list[dict], list[dict]]:
-    """Return (segments, words). `words` is empty unless word_timestamps=True.
+) -> tuple[list[dict], list[dict], str | None]:
+    """Return (segments, words, language). `words` is empty unless requested.
 
     Runs whisper.cpp once for clean segments; when words are requested, a second
-    pass in --max-len 1 --split-on-word mode yields word-level timings.
+    pass in --max-len 1 --split-on-word mode yields word-level timings. The third
+    element is the language whisper detected (or the one it was pinned to) —
+    transcription itself always stays in the spoken language (no `-tr`).
     """
     seg_data = _run_whisper(
         model, audio_wav, audio_wav.with_name(audio_wav.stem + "_seg"),
@@ -161,28 +177,33 @@ def transcribe_audio_local(
         {"start": round(s, 2), "end": round(e, 2), "text": t}
         for t, s, e in _rows(seg_data)
     ]
+    language = detected_language(seg_data)
 
     words: list[dict] = []
     if word_timestamps:
         word_data = _run_whisper(
             model, audio_wav, audio_wav.with_name(audio_wav.stem + "_words"),
-            lang=lang, word_level=True,
+            # Pin the second pass to what pass one heard, so word timings can't
+            # land in a different language than the segments.
+            lang=language or lang, word_level=True,
         )
         words = [
             {"word": t, "start": round(s, 3), "end": round(e, 3)}
             for t, s, e in _rows(word_data)
         ]
-    return segments, words
+    return segments, words, language
 
 
 def transcribe_video_local(
     video_path: str, audio_out: Path, model: Path, lang: str = DEFAULT_LANG,
-) -> list[dict]:
-    """Extract audio → transcribe → return segments."""
+) -> tuple[list[dict], str | None]:
+    """Extract audio → transcribe → return (segments, detected language)."""
     wav = audio_out if audio_out.suffix == ".wav" else audio_out.with_suffix(".wav")
     extract_audio_wav(video_path, wav)
-    segments, _ = transcribe_audio_local(wav, model, word_timestamps=False, lang=lang)
-    return segments
+    segments, _, language = transcribe_audio_local(
+        wav, model, word_timestamps=False, lang=lang,
+    )
+    return segments, language
 
 
 if __name__ == "__main__":
@@ -197,8 +218,11 @@ if __name__ == "__main__":
     mdl = resolve_model(model_override)
     src_path = Path(src)
     if src_path.suffix.lower() == ".wav":
-        segs, words = transcribe_audio_local(src_path, mdl, word_timestamps=want_words)
+        segs, words, language = transcribe_audio_local(src_path, mdl, word_timestamps=want_words)
     else:
-        segs = transcribe_video_local(src, Path("audio.wav"), mdl)
+        segs, language = transcribe_video_local(src, Path("audio.wav"), mdl)
         words = []
-    print(json.dumps({"model": str(mdl), "segments": segs, "words": words}, indent=2))
+    print(json.dumps(
+        {"model": str(mdl), "language": language, "segments": segs, "words": words},
+        indent=2, ensure_ascii=False,
+    ))

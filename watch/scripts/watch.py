@@ -21,12 +21,42 @@ from frames import (  # noqa: E402
     format_time, get_metadata, parse_time, select_hero_frames,
 )
 from hook import analyse_hook  # noqa: E402
+from languages import describe, name_for, normalize, same_language  # noqa: E402
 from pacing import compute_pacing  # noqa: E402
 from report import write_report  # noqa: E402
 from transcribe import filter_range, format_transcript, parse_vtt  # noqa: E402
 from whisper_local import (  # noqa: E402
     DEFAULT_LANG, WhisperLocalError, resolve_model, transcribe_video_local,
 )
+
+
+def resolve_report_language(
+    override: str | None,
+    whisper_lang: str | None,
+    metadata_lang: str | None,
+    caption_lang: str | None,
+    hook_lang: str | None,
+    requested_lang: str | None,
+) -> tuple[str | None, str | None]:
+    """Decide what language the report gets written in, and say who decided.
+
+    Most-trusted first: an explicit override, then whisper listening to the
+    whole audio track, then the uploader's own metadata, then the caption track
+    that shipped, then whisper on the 10s hook (short clips misdetect on music
+    or silence), then a language the caller pinned via --lang.
+    """
+    for value, source in (
+        (override, "--report-lang"),
+        (whisper_lang, "whisper (full audio)"),
+        (metadata_lang, "source metadata"),
+        (caption_lang, "caption track"),
+        (hook_lang, "whisper (hook, 10s)"),
+        (requested_lang, "--lang"),
+    ):
+        code = normalize(value)
+        if code:
+            return code, source
+    return None, None
 
 
 def main() -> int:
@@ -66,6 +96,19 @@ def main() -> int:
         help="Why the user wants to watch this video. Shapes report.md TL;DR + entity emphasis.",
     )
     ap.add_argument(
+        "--report-lang",
+        type=str,
+        default="auto",
+        help="Language the report should be written in. Default 'auto' = the language "
+             "the video is spoken in (detected). Pass a code (e.g. 'en', 'pl') to override.",
+    )
+    ap.add_argument(
+        "--no-probe",
+        action="store_true",
+        help="Skip the yt-dlp metadata probe that detects the source language "
+             "(captions then fall back to English).",
+    )
+    ap.add_argument(
         "--no-scene-change",
         action="store_true",
         help="Force uniform frame sampling (skip scene-change detection).",
@@ -90,7 +133,7 @@ def main() -> int:
         "[watch] downloading via yt-dlp…" if is_url(args.source) else "[watch] using local file…",
         file=sys.stderr,
     )
-    dl = download(args.source, work / "download")
+    dl = download(args.source, work / "download", probe=not args.no_probe)
     video_path = dl["video_path"]
 
     meta = get_metadata(video_path)
@@ -182,6 +225,7 @@ def main() -> int:
     transcript_segments: list[dict] = []
     transcript_text: str | None = None
     transcript_source: str | None = None
+    whisper_lang: str | None = None
     if dl.get("subtitle_path"):
         try:
             all_segments = parse_vtt(dl["subtitle_path"])
@@ -194,7 +238,7 @@ def main() -> int:
     if not transcript_segments and not args.no_whisper:
         try:
             model = resolve_model(args.whisper_model)
-            all_segments = transcribe_video_local(
+            all_segments, whisper_lang = transcribe_video_local(
                 video_path, work / "audio.wav", model, lang=args.lang,
             )
             transcript_segments = filter_range(all_segments, start_sec, end_sec) if focused else all_segments
@@ -210,6 +254,15 @@ def main() -> int:
 
     info = dl.get("info") or {}
 
+    report_lang, lang_source = resolve_report_language(
+        override=args.report_lang,
+        whisper_lang=whisper_lang,
+        metadata_lang=dl.get("source_language"),
+        caption_lang=dl.get("subtitle_lang") if transcript_source == "captions" else None,
+        hook_lang=hook_result.get("language"),
+        requested_lang=args.lang,
+    )
+
     # Build report.md (the structured artifact).
     hero_frames = select_hero_frames(frames, pacing=pacing)
     report_path = write_report(
@@ -224,6 +277,8 @@ def main() -> int:
         hero_frames=hero_frames,
         pacing=pacing,
         hook=hook_result,
+        language=report_lang,
+        language_source=lang_source,
     )
 
     print()
@@ -253,6 +308,18 @@ def main() -> int:
         )
     else:
         print("- **Transcript:** none available")
+    lang_note = f" — via {lang_source}" if lang_source else ""
+    print(f"- **Spoken language:** {describe(report_lang)}{lang_note}")
+
+    print()
+    write_in = name_for(report_lang) or "the language spoken in the video"
+    not_english = "" if same_language(report_lang, "en") else ", not English"
+    print(
+        f"> **Write the report in {write_in}.** Every narrative section of "
+        f"`report.md` — and its headings — goes in {write_in}{not_english}. "
+        "Quotes stay verbatim. Answer the user in chat in whatever language "
+        "*they* wrote to you in."
+    )
 
     if not focused and full_duration > 600:
         mins = int(full_duration // 60)
@@ -304,6 +371,11 @@ def main() -> int:
     print("---")
     print(f"_Report: `{report_path}`_")
     print(f"_Work dir: `{work}` — delete when done._")
+    print(
+        "_Next: fill every `<!-- pending Claude fill … -->` marker in the report "
+        f"(in {write_in}), then **print the finished report in chat** — the user "
+        "reads it there, not by opening the file._"
+    )
 
     return 0
 
