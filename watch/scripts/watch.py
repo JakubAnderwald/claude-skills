@@ -23,7 +23,7 @@ from frames import (  # noqa: E402
 from hook import analyse_hook  # noqa: E402
 from languages import describe, name_for, normalize, same_language  # noqa: E402
 from pacing import compute_pacing  # noqa: E402
-from report import write_report  # noqa: E402
+from report import is_form_intent, write_report  # noqa: E402
 from transcribe import filter_range, format_transcript, parse_vtt  # noqa: E402
 from whisper_local import (  # noqa: E402
     DEFAULT_LANG, WhisperLocalError, resolve_model, transcribe_video_local,
@@ -93,7 +93,9 @@ def main() -> int:
         "--intent",
         type=str,
         default="",
-        help="Why the user wants to watch this video. Shapes report.md TL;DR + entity emphasis.",
+        help="Why the user wants to watch this video. Aims the report's TL;DR and "
+             "Conclusions, and decides whether the craft sections appear "
+             "(see --form-analysis).",
     )
     ap.add_argument(
         "--report-lang",
@@ -117,6 +119,23 @@ def main() -> int:
         "--no-hook-microscope",
         action="store_true",
         help="Skip the dense 0-10s hook re-pass.",
+    )
+    form = ap.add_mutually_exclusive_group()
+    form.add_argument(
+        "--form-analysis",
+        dest="form_analysis",
+        action="store_true",
+        default=None,
+        help="Promote the hook breakdown and editorial profile to full report "
+             "sections. Default: inferred from --intent (on only when the user "
+             "asked about craft — hook, editing, pacing, montaż, tempo...).",
+    )
+    form.add_argument(
+        "--no-form-analysis",
+        dest="form_analysis",
+        action="store_false",
+        help="Force craft metrics down to a raw-numbers appendix even when the "
+             "intent mentions form.",
     )
     args = ap.parse_args()
 
@@ -279,6 +298,7 @@ def main() -> int:
         hook=hook_result,
         language=report_lang,
         language_source=lang_source,
+        form_analysis=args.form_analysis,
     )
 
     print()
@@ -310,6 +330,12 @@ def main() -> int:
         print("- **Transcript:** none available")
     lang_note = f" — via {lang_source}" if lang_source else ""
     print(f"- **Spoken language:** {describe(report_lang)}{lang_note}")
+    form_on = args.form_analysis if args.form_analysis is not None else is_form_intent(args.intent)
+    how = "explicit flag" if args.form_analysis is not None else "inferred from --intent"
+    print(
+        f"- **Report focus:** {'content + form' if form_on else 'content'} "
+        f"({how}) — {'hook + editorial sections included' if form_on else 'craft metrics are a raw appendix, write no commentary on them'}"
+    )
 
     print()
     write_in = name_for(report_lang) or "the language spoken in the video"
