@@ -39,25 +39,43 @@ Classify results:
 - **Any failed** (state is `FAILURE` or `CANCELLED`): there are failures — inform the user and stop. Do NOT attempt to fix failures in this skill (use `/push` for that).
 - **Any still running** (state is `PENDING` or `QUEUED` or `IN_PROGRESS`): wait 30 seconds and re-check. Repeat up to 60 times (~30 minutes). If still not done, inform the user and stop.
 
-### 2b. Check for unresolved review comments
+### 2b. Check that every review thread is resolved
 
-Fetch all review comments and verify every thread is resolved:
+**GraphQL `isResolved` is the only authority.** Do not infer resolution from REST reply IDs:
+a thread can carry replies and still be unresolved, and a thread can be marked resolved
+having never been answered. `/merge` is the gate — it reads thread state and never changes it.
 
-1. **Get top-level comment IDs:**
+1. **Resolve the identifiers once:**
 ```bash
-TOP_IDS=$(gh api repos/{owner}/{repo}/pulls/{number}/comments --jq '[.[] | select(.in_reply_to_id == null) | .id]')
+read -r OWNER REPO <<<"$(gh repo view --json owner,name --jq '.owner.login + " " + .name')"
+NUM=$(gh pr view --json number --jq .number)
 ```
 
-2. **Get reply-to IDs:**
+2. **List every unresolved thread:**
 ```bash
-REPLY_IDS=$(gh api repos/{owner}/{repo}/pulls/{number}/comments --jq '[.[] | select(.in_reply_to_id != null) | .in_reply_to_id] | unique')
+gh api graphql -f owner="$OWNER" -f repo="$REPO" -F number="$NUM" -f query='
+query($owner:String!,$repo:String!,$number:Int!){
+  repository(owner:$owner,name:$repo){ pullRequest(number:$number){
+    reviewThreads(first:100){ nodes{
+      id isResolved isOutdated path line
+      comments(first:1){ nodes{ author{login} body } } } } } }
+}' --jq '[.data.repository.pullRequest.reviewThreads.nodes[]
+          | select(.isResolved == false)
+          | "\(.path):\(.line) [\(.comments.nodes[0].author.login)] \(.comments.nodes[0].body | split("\n")[0][0:100])"]
+         | .[]'
 ```
 
-3. Compare: any ID in `TOP_IDS` not present in `REPLY_IDS` is an unresolved thread. If unresolved threads exist, inform the user and stop — use `/push` to address them first.
+3. **If it prints anything, STOP.** List each `path:line` for the user and tell them to run
+   `/push` to address them. Do **not** resolve them here — resolving a thread is a statement
+   that you read it and acted on it, and `/merge` has done neither. A merge blocked by an
+   open thread is the gate working.
+
+   (If the query returns 100 threads the page is full — re-query with a cursor rather than
+   merging on a truncated view.)
 
 4. **Check for reviews requesting changes:**
 ```bash
-gh api repos/{owner}/{repo}/pulls/{number}/reviews --jq '[.[] | select(.state == "CHANGES_REQUESTED") | {login: .user.login, state}]'
+gh api "repos/$OWNER/$REPO/pulls/$NUM/reviews" --jq '[.[] | select(.state == "CHANGES_REQUESTED") | {login: .user.login, state}]'
 ```
 If any review has `CHANGES_REQUESTED`, inform the user and stop.
 
@@ -70,8 +88,8 @@ Use the GitHub API to squash-merge (avoids the worktree issue where `gh pr merge
 **Capture the response and verify `"merged": true` before doing anything else:**
 
 ```bash
-OWNER_REPO="{owner}/{repo}"; NUM={number}
-MERGE_JSON=$(gh api --method PUT "repos/$OWNER_REPO/pulls/$NUM/merge" -f merge_method=squash 2>&1)
+# $OWNER, $REPO and $NUM are already set from Step 2b — do not re-type them as literals.
+MERGE_JSON=$(gh api --method PUT "repos/$OWNER/$REPO/pulls/$NUM/merge" -f merge_method=squash 2>&1)
 echo "$MERGE_JSON"
 MERGED=$(printf '%s' "$MERGE_JSON" | jq -r '.merged // false' 2>/dev/null)
 echo "merged=$MERGED"
@@ -87,7 +105,7 @@ If `MERGED` is not exactly `true` — for ANY reason (404 wrong-method, 405 "not
 
 As a final guard, re-confirm the PR is actually merged before deleting anything:
 ```bash
-gh pr view {number} --json state,mergedAt --jq '"\(.state) \(.mergedAt)"'
+gh pr view "$NUM" --json state,mergedAt --jq '"\(.state) \(.mergedAt)"'
 # Must print "MERGED <timestamp>". If it prints "CLOSED null" or "OPEN null", STOP — do not delete the branch.
 ```
 

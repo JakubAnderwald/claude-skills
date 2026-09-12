@@ -9,11 +9,16 @@ user-invocable: true
 
 Follow these steps precisely. Do NOT skip the polling loop.
 
+> **The contract this skill enforces:** every review thread blocks the merge. Address each
+> one — fix it, or decide no change is needed — then reply on the thread saying which and
+> why, and resolve it. **Never resolve a thread you did not act on.** There is no step in
+> this skill that resolves threads in bulk, and you must not invent one.
+
 ## Step 1: Stage & Commit
 
 1. Run `git status` and `git diff` to review all pending changes (staged and unstaged).
 2. Stage all changes: `git add -A`.
-3. Create a commit with a concise, descriptive message summarizing the changes. Use conventional-commit style if the repo already uses it. End the commit message with:
+3. Create a commit with a concise, descriptive message summarizing the changes. Use conventional-commit style if the repo already uses it. If your environment mandates a commit attribution footer (Claude Code supplies the current one), append exactly that — do not hardcode a model name here, it goes stale.
 4. If there are no changes to commit, inform the user and skip to Step 4 (push only if there are unpushed commits — Steps 2 and 3 still apply: rebase onto the base branch, then push).
 
 ## Step 2: Rebase onto the base branch
@@ -55,6 +60,10 @@ Keep the PR current with its merge target so CI runs against the integrated stat
 6. **Sanity check after rebase.** If the repo has a fast local test or typecheck harness (e.g., `pnpm test` for the touched package, `pnpm typecheck`, `cargo test`, language-specific equivalents), run it once so a silent merge defect doesn't ride into CI. If the harness is too slow to run in full, run the subset that exercises the touched files. Skip this step only if no such harness exists.
    - If the post-rebase sanity check fails, fix the failure (commit on top of the rebased branch) before pushing — don't push a known-broken rebased state.
 
+> A rebase moves the lines review threads are anchored to. Threads that no longer point at
+> live code come back from Step 5b with `isOutdated: true` — that is a *disposition* you can
+> use in Step 5d, not permission to skip them.
+
 ## Step 3: Push
 
 1. **If you rebased and `FORCE_PUSH=1`:** `git push --force-with-lease`. Never use `--force` without `--with-lease` (it can clobber concurrent pushes from a teammate).
@@ -69,6 +78,28 @@ Keep the PR current with its merge target so CI runs against the integrated stat
 3. Store the PR number for the polling loop.
 
 ## Step 5: Poll for CI/CD Checks and Reviews
+
+Resolve these once, before the loop, and reuse them throughout:
+
+```bash
+read -r OWNER REPO <<<"$(gh repo view --json owner,name --jq '.owner.login + " " + .name')"
+NUM=$(gh pr view --json number --jq .number)
+ME=$(gh api user --jq .login)
+WORK="${TMPDIR:-/tmp}/pr-review-$NUM"; mkdir -p "$WORK"
+```
+
+**Never write scratch files into the repo.** Step 1 runs `git add -A`, so anything you drop
+in the working tree gets committed on the next iteration. Everything transient goes in
+`$WORK`.
+
+Two `gh` gotchas that bite here:
+
+- `{owner}` and `{repo}` are real `gh api` placeholders and are substituted from the current
+  repo — but `{number}` is **not**, and none of the three work inside a GraphQL query body.
+  Use `"$OWNER"`, `"$REPO"`, `"$NUM"` explicitly so one convention covers both APIs.
+- **REST and GraphQL report bot logins differently.** REST returns `coderabbitai[bot]`;
+  GraphQL strips the suffix and returns `coderabbitai`. Never reuse a login filter across the
+  two.
 
 Enter a loop. On each iteration:
 
@@ -86,90 +117,137 @@ Classify the results across **all** checks — both CI jobs and review bots (e.g
 
 **CRITICAL:** Do NOT ignore pending non-CI checks. Review bots like CodeRabbit may post new comments after they finish. You must wait for ALL checks to complete before declaring "Done" — otherwise you risk merging before a reviewer has finished and potentially missing new feedback.
 
-### 5b. Check review and PR comments (EVERY iteration)
+### 5b. Fetch review threads and comments (EVERY iteration)
 
-**IMPORTANT:** You MUST fetch comments on EVERY poll iteration, not just when all checks are green. Review bots frequently post comments while their check status is still PENDING. If you skip fetching comments while waiting for checks, you waste time that could be spent addressing already-posted feedback.
+**IMPORTANT:** You MUST fetch on EVERY poll iteration, not just when all checks are green. Review bots frequently post comments while their check status is still PENDING. If you skip fetching while waiting for checks, you waste time that could be spent addressing already-posted feedback.
 
-**IMPORTANT:** Use JSON output (not TSV) to avoid parsing issues with multi-line markdown bodies.
+**GraphQL `reviewThreads` is the only authority on what blocks the merge.** `isResolved` is
+the real state; REST reply IDs are not a proxy for it, in either direction. A thread can
+carry replies and still be unresolved, and a thread can be marked resolved having never been
+answered at all.
 
-Run these commands to fetch BOTH line-level review comments and general PR comments:
+**1. Unresolved review threads — the blocking set:**
 
-1. **Get line-level review comments (with reply counts):**
 ```bash
-gh api repos/{owner}/{repo}/pulls/{number}/comments --jq '
-  [.[] | {id, type: "line", login: .user.login, path, line: (.line // .original_line),
-           subject: (.body | split("\n")[0] | .[0:120]),
-           has_replies: (if .in_reply_to_id then true else false end)}]
-  | [.[] | select(.has_replies == false)]' > pr_comments.json
+gh api graphql -f owner="$OWNER" -f repo="$REPO" -F number="$NUM" -f query='
+query($owner:String!,$repo:String!,$number:Int!){
+  repository(owner:$owner,name:$repo){ pullRequest(number:$number){
+    reviewThreads(first:100){ nodes{
+      id isResolved isOutdated path line
+      comments(first:50){ nodes{ author{login} body } } } } } }
+}' --jq '[.data.repository.pullRequest.reviewThreads.nodes[]
+          | select(.isResolved == false)
+          | {id, path, line, isOutdated,
+             lastAuthor: (.comments.nodes | last | .author.login),
+             comments: [.comments.nodes[] | {author: .author.login, body}]}]' \
+  > "$WORK/threads.json"
+jq 'length' "$WORK/threads.json"
 ```
 
-This filters to only **top-level comments without replies** (i.e., unresolved threads).
+- **No author filter.** Every unresolved thread blocks, whoever opened it. That is the point.
+- Full bodies, not truncated first lines — a CodeRabbit finding's heading tells you nothing
+  about what it wants.
+- `lastAuthor` replaces the old "did a reviewer speak last?" heuristic. If it is not you, the
+  thread needs your answer; if it is you and the thread is still unresolved, you replied and
+  forgot to resolve.
+- If this returns exactly 100, the page is full — re-query with `after:` and a cursor rather
+  than silently reviewing a truncated set.
 
-2. **Get general PR comments:**
+**2. General PR comments** (issue comments — no thread concept, so track answered state with
+a marker you write yourself in Step 5d):
+
 ```bash
-gh api repos/{owner}/{repo}/issues/{number}/comments --jq '
-  [.[] | {id, type: "general", login: .user.login,
-           subject: (.body | split("\n")[0] | .[0:120])}]' >> pr_comments.json
+# piped to real jq, not `gh api --jq`, because only jq proper takes --arg
+gh api --paginate "repos/$OWNER/$REPO/issues/$NUM/comments" | jq --arg me "$ME" '
+  ([.[].body | scan("<!-- addressed:([0-9]+) -->") | .[0]]) as $done
+  | [.[] | select(.user.login != $me)
+         | select((.id|tostring) as $i | $done | index($i) | not)
+         | {id, login: .user.login, body}]' > "$WORK/issue-comments.json"
+jq 'length' "$WORK/issue-comments.json"
 ```
 
-3. **Check for PR-level reviews requesting changes or containing actionable comments:**
+**3. Reviews requesting changes:**
+
 ```bash
-gh api repos/{owner}/{repo}/pulls/{number}/reviews --jq '
+gh api "repos/$OWNER/$REPO/pulls/$NUM/reviews" --jq '
   [.[] | select(.state == "CHANGES_REQUESTED" or (.state == "COMMENTED" and (.body | length) > 0))
    | {login: .user.login, state}]'
 ```
 
-*Crucial Step:* Analyze `pr_comments.json`. Apply these filters:
-- **Ignore** comments authored by yourself, Claude, `github-actions[bot]`, or `vercel[bot]`
-- **Include** comments from all other reviewers (human or bot reviewers like `coderabbitai[bot]`)
-- A comment is **unresolved** if it is a top-level comment with no reply from you in this loop
-- Count the number of unresolved comments to decide next action
-
-4. **Check for reviewer follow-up replies (CRITICAL — easy to miss):**
-
-Review bots often reply to YOUR reply with follow-up concerns or confirmations. These follow-ups are NOT top-level comments — they are replies themselves. You must also check for threads where a reviewer's message is the LAST in the chain:
-
-```bash
-gh api repos/{owner}/{repo}/pulls/{number}/comments --jq '
-  [group_by(.in_reply_to_id // .id)[] |
-   sort_by(.created_at) | last |
-   select(.user.login != "github-actions[bot]" and .user.login != "vercel[bot]") |
-   {id, login: .user.login, subject: (.body | split("\n")[0] | .[0:120])}] |
-  [.[] | select(.login != "<your-github-login>")]'
-```
-
-Any thread where a reviewer (not you) posted the last message needs your reply.
-
 ### 5c. Decide what to do
 
-| All Checks Status | Unresolved/Unanswered Comments | Action |
-|-------------------|--------------------------------|--------|
-| Any still running | **Yes** | Address comments immediately (Step 5d), then continue polling — do NOT wait idle when there is work to do |
-| Any still running | None | Wait 30 seconds, then poll again (Step 5g) |
-| All green | None | Pass the Critical Gate (Step 5f-gate), verify conversations resolved (Step 5f), then go to Step 6 |
-| All green | Yes | Address comments (Step 5d), then push and re-poll |
-| Any failed | Any | Fix failures (Step 5e), then push and re-poll |
+| All Checks Status | Open threads | Unanswered PR comments | Action |
+|-------------------|--------------|------------------------|--------|
+| Any still running | >0 | any | Address threads immediately (Step 5d), then continue polling — do NOT wait idle when there is work to do |
+| Any still running | 0 | >0 | Answer them (Step 5d.6), then continue polling |
+| Any still running | 0 | 0 | Wait 30 seconds, then poll again (Step 5g) |
+| All green | >0 | any | Address threads (Step 5d), then push and re-poll |
+| All green | 0 | >0 | Answer them (Step 5d.6), then push and re-poll |
+| All green | 0 | 0 | Verify (Step 5f), then go to Step 6 |
+| Any failed | any | any | Fix failures (Step 5e), then push and re-poll |
 
-**IMPORTANT:** "Any still running" means ANY check — including review bots like CodeRabbit. Never treat a PENDING check as complete just because it has been pending for a long time. Always wait for every check to reach a terminal state (SUCCESS, FAILURE, CANCELLED, or SKIPPED). However, do NOT sit idle while waiting for checks if there are already unresolved comments posted. Address those comments immediately while CI continues to run.
+Green CI with open threads is never a "go to Step 6" row.
 
-### 5d. Address review comments
+**IMPORTANT:** "Any still running" means ANY check — including review bots like CodeRabbit. Never treat a PENDING check as complete just because it has been pending for a long time. Always wait for every check to reach a terminal state (SUCCESS, FAILURE, CANCELLED, or SKIPPED). However, do NOT sit idle while waiting for checks if there is already feedback posted. Address it while CI continues to run.
 
-For EACH unresolved or unanswered comment identified in Step 5b:
-1. Read the referenced file/context and understand the comment.
-2. If the fix is clear, make the change in the code.
-3. If the fix is ambiguous, involves a design decision, or requires clarification, ask the user using `AskUserQuestion`.
-4. **Mandatory Reply:** After fixing the code or deciding on an action, you MUST reply to the comment on GitHub so it is marked as addressed.
-   
-   *For Line Comments (from the pulls API):*
+### 5d. Address review threads — one at a time, reply then resolve
+
+Work through `$WORK/threads.json` **thread by thread** — `TID` below is that thread's
+`.id`, and it is the only id involved:
+
+```bash
+jq -r '.[].id' "$WORK/threads.json"   # one TID per unresolved thread
+```
+
+For each:
+
+1. **Read every comment body in the thread**, in full — not the first line, not just the
+   opening comment. Then read the code it points at (`path`:`line`).
+
+2. **Pick exactly one disposition:**
+   - **fixed** — make the change.
+   - **no change needed** — with a concrete technical reason. "Acknowledged", "good catch",
+     or "will address separately" are not dispositions.
+   - **outdated** — only when `isOutdated` is true **and** the code it anchors to is genuinely
+     gone. Name the commit that superseded it.
+   - **needs the user** — the fix is a design decision or the comment is ambiguous. Use
+     `AskUserQuestion`. Do **not** reply, do **not** resolve, leave the thread open.
+
+3. **Reply on that exact thread**, saying which disposition and why:
    ```bash
-   gh api repos/{owner}/{repo}/pulls/{number}/comments/{comment_id}/replies -f body="Fixed: <brief explanation of what you did>"
+   gh api graphql -f threadId="$TID" -f body="$BODY" -f query='
+   mutation($threadId:ID!,$body:String!){
+     addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:$threadId,body:$body}){
+       comment{ url } } }'
    ```
-   
-   *For General PR Comments (from the issues API):*
+
+4. **Only then resolve that same id:**
    ```bash
-   gh api repos/{owner}/{repo}/issues/{number}/comments -f body="> Reply to comment {comment_id}: Fixed: <brief explanation>"
+   gh api graphql -f threadId="$TID" -f query='
+   mutation($threadId:ID!){
+     resolveReviewThread(input:{threadId:$threadId}){ thread{ isResolved } } }'
    ```
-5. Once all comments are addressed and replied to, commit the changes, push to the branch (re-running Steps 2–3 so the new commit lands on top of the latest base), and return to Step 5.
+
+> 🚫 **Never pass a thread id to `resolveReviewThread` that you did not pass to
+> `addPullRequestReviewThreadReply` in this same run.** Never loop over "all unresolved
+> ids". Resolving a thread is your statement that you read it and acted on it; a thread
+> resolved with no reply is indistinguishable from feedback thrown away, and defeats
+> `required_conversation_resolution` entirely.
+
+Reply and resolve take the **same** `threadId`, so there is no REST-comment-id mapping to get
+wrong — stay in GraphQL for both.
+
+5. Once the threads are handled, commit the changes, push (re-running Steps 2–3 so the new
+   commit lands on top of the latest base), and return to Step 5.
+
+6. **General PR comments** from `$WORK/issue-comments.json` have no thread to resolve. Answer
+   each with a new issue comment whose body ends with a marker naming the comment you are
+   answering, so Step 5b can tell answered from unanswered on the next iteration:
+   ```bash
+   CID=<the comment id you are answering>   # from $WORK/issue-comments.json
+   gh api "repos/$OWNER/$REPO/issues/$NUM/comments" \
+     -f body="$(printf '%s\n\n<!-- addressed:%s -->' "$REPLY_TEXT" "$CID")"
+   ```
 
 ### 5e. Fix CI failures
 
@@ -186,76 +264,37 @@ For EACH unresolved or unanswered comment identified in Step 5b:
 4. Stage, commit (with a message like "fix: resolve CI failure in <check name>"), and push.
 5. Return to the top of the polling loop (Step 5).
 
-### 5f-gate. CRITICAL GATE — Must pass before Step 6
+### 5f. Verify — observe, do not act
 
-**This gate cannot be skipped under any circumstances.**
+**This step takes no mutating action.** It re-reads the state and decides whether Step 6 is
+allowed. If it finds work outstanding, the answer is to go back to Step 5d or to stop and
+tell the user — never to resolve anything here.
 
-Before proceeding to Step 5f or Step 6, you MUST:
+1. **Re-run Step 5b query 1.** Do not reuse the earlier result; new comments arrive while you
+   work.
 
-1. **Fetch ALL line-level review comments one final time** using the same commands from Step 5b. Do not rely on cached results — new comments may have arrived since your last fetch.
-2. **Verify every top-level comment has been replied to** by you (excluding comments from yourself, Claude, `github-actions[bot]`, or `vercel[bot]`).
-3. **Verify every reviewer follow-up has been replied to.** Check that YOU are the last commenter in every thread. Review bots frequently reply to your reply — you must address their follow-up before the thread can be resolved.
-4. **If ANY unreplied comment exists from a non-ignored author** (whether top-level OR follow-up), go back to Step 5d to address it. Do NOT proceed.
-5. Only after confirming zero unreplied comments across all threads, continue to Step 5f.
+2. **Count what is still open:**
+   ```bash
+   jq 'length' "$WORK/threads.json"
+   ```
 
-### 5f. Verify all conversations are resolved AND resolve them on GitHub
+3. **If the count is not `0`,** those are threads you deliberately left open (the
+   **needs the user** disposition) or threads that arrived since your last pass:
+   - Newly arrived → back to Step 5d.
+   - Waiting on the user → **report them and stop.** Print each as `path:line — <why it is
+     open>`, and tell the user the PR cannot merge until they are answered.
+   - **Do not resolve them to make the count zero.** That is the failure mode this step
+     exists to prevent.
 
-Before declaring "Done", confirm that the PR can actually be merged. **Replying to a comment does NOT resolve the GitHub conversation thread.** You must explicitly resolve each thread via the GraphQL API.
+4. **Check nothing is waiting on you elsewhere:** `$WORK/issue-comments.json` must be empty,
+   and no review may be in `CHANGES_REQUESTED`.
 
-1. **Check for reviewer follow-up replies you haven't addressed:**
-
-Review bots (like CodeRabbit) often reply to YOUR reply with follow-up questions or confirmations. These follow-ups need your response too. Check for any comment from a non-ignored author that is the LAST message in its thread and has no reply from you after it:
-
-```bash
-# Get the full comment chain to identify threads where a reviewer spoke last
-gh api repos/{owner}/{repo}/pulls/{number}/comments --jq '
-  [.[] | {id, in_reply_to_id, login: .user.login}]'
-```
-
-For each thread, check if the last message is from a reviewer (not you). If so, reply to acknowledge or address it before proceeding.
-
-2. **Resolve all review threads via GraphQL:**
-
-First, find unresolved threads:
-```bash
-gh api graphql -f query='{
-  repository(owner: "{owner}", name: "{repo}") {
-    pullRequest(number: {number}) {
-      reviewThreads(first: 50) {
-        nodes { id isResolved comments(first: 1) { nodes { body author { login } } } }
-      }
-    }
-  }
-}' --jq '.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false) | .id'
-```
-
-Then resolve each unresolved thread:
-```bash
-gh api graphql -f query='mutation { resolveReviewThread(input: {threadId: "<thread_id>"}) { thread { isResolved } } }'
-```
-
-**Do this for EVERY unresolved thread.** Do NOT proceed until all threads show `isResolved: true`.
-
-3. **Final verification:**
-```bash
-gh api graphql -f query='{
-  repository(owner: "{owner}", name: "{repo}") {
-    pullRequest(number: {number}) {
-      reviewThreads(first: 50) {
-        nodes { isResolved }
-      }
-    }
-  }
-}' --jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false)] | length'
-```
-
-This must return `0`. If not, go back and resolve the remaining threads.
-
-4. If all conversations are resolved, proceed to Step 6.
+5. Only with zero open threads, zero unanswered PR comments, and no `CHANGES_REQUESTED`,
+   proceed to Step 6.
 
 ### 5g. Wait between polls
 
-If CI is still running, wait 30 seconds before the next iteration:
+If CI is still running and there is nothing to address, wait 30 seconds before the next iteration:
 ```bash
 sleep 30
 ```
@@ -264,10 +303,11 @@ Do not poll more than 60 times (i.e., ~30 minutes). If the limit is reached, inf
 
 ## Step 6: Report Success
 
-When all CI checks are green and there are no unresolved review comments:
+When all CI checks are green and every review thread is genuinely resolved:
 1. Print a summary:
    - Commit(s) pushed
    - PR URL
    - All checks passed
-   - Any comments that were addressed
+   - Each review thread addressed, with its disposition (fixed / no change needed / outdated)
+   - Any threads left open and why (if any — in which case this is not a success report)
 2. Inform the user that the push cycle is complete.
