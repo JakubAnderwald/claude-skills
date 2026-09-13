@@ -9,6 +9,10 @@ user-invocable: true
 
 Follow these steps precisely. This command merges the current branch's PR into main and cleans up so you're ready for the next task.
 
+> **Two things gate the merge, and they are different questions.** *Is every review thread
+> resolved?* (Step 2b) and *has anything reviewed this commit at all?* (Step 2c). A PR with
+> zero unresolved threads because nobody reviewed it passes the first and fails the second.
+
 ## Step 1: Identify the PR
 
 1. Confirm you are NOT on `main`:
@@ -79,6 +83,47 @@ gh api "repos/$OWNER/$REPO/pulls/$NUM/reviews" --jq '[.[] | select(.state == "CH
 ```
 If any review has `CHANGES_REQUESTED`, inform the user and stop.
 
+### 2c. Check that something has actually reviewed this commit
+
+Green CI and zero unresolved threads do **not** mean the code was reviewed. When the reviewer
+has not run there are no comments to resolve, so "no complaints" and "approved" look identical.
+That is exactly how a PR merged with four bypasses in it: the check for CodeRabbit had gone
+from `PENDING` to *absent* and absence was read as done. Twenty minutes later the same check
+reported `SUCCESS` while CodeRabbit was rate-limited and had reviewed nothing.
+
+**Neither the check list nor the thread count can answer this.** Ask the repo:
+
+```bash
+# Resolve from the repo root, not the cwd — /merge often runs in a worktree, and
+# a relative path silently breaks the moment you are one directory down.
+ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
+GATE="$ROOT/scripts/lib/coderabbit-cli.mjs"
+if [[ -n "$ROOT" && -f "$GATE" ]]; then
+  COVERAGE=$(node "$GATE" coverage --pr "$NUM" 2>&1); RC=$?
+  printf '%s\nexit=%s\n' "$COVERAGE" "$RC"     # print BOTH: the table below is keyed on the exit code
+elif [[ -n "$ROOT" ]] && git cat-file -e "origin/main:scripts/lib/coderabbit-cli.mjs" 2>/dev/null; then
+  echo "GATE_STALE"   # the gate exists on main but not in this checkout
+fi
+```
+
+| result | what to do |
+|---|---|
+| `exit=0` (`covered: true`) | **Proceed to Step 3.** Say nothing about it — a covered PR is the normal case, and which reviewer covered it is not the user's problem. |
+| `exit=2` with `"retryable": true` | A review is running. Wait 60s and re-run, up to **15 times** — a real CodeRabbit review takes 10–15 minutes, so a shorter budget just turns the healthy case into a false alarm. **If it then reports covered, go back to Step 2b** before Step 3: the review that just finished may have opened threads. |
+| `exit=2` otherwise | **STOP.** Print `.reason` and the short head SHA. |
+| any other exit | **STOP.** The gate could not answer — say so. Do not treat "could not check" as "fine"; that is the same fail-open mistake in a new place. |
+| `GATE_STALE` | **STOP.** This branch predates the gate, so it cannot check itself. Say so and offer to rebase onto `main`. Skipping here would silently disarm the check on exactly the older PRs most likely to need it. |
+| neither printed | The repo has no gate — skip this step. |
+
+When you stop, the user may reply "merge anyway" — then continue to Step 3. The point is that
+skipping the reviewer becomes a decision someone makes, not something that happens quietly.
+
+Do not improvise a replacement check when the gate is unavailable. Deciding whether a review
+covers a commit is subtler than it looks — a bot review's `commit_id` says nothing about what
+it reviewed, an empty-bodied "review" is a thread reply, and a run whose findings failed to
+parse renders identically to a clean one. Getting any of those wrong reports the opposite of
+the truth.
+
 ## Step 3: Merge the PR
 
 Use the GitHub API to squash-merge (avoids the worktree issue where `gh pr merge --delete-branch` tries to checkout `main`).
@@ -89,7 +134,11 @@ Use the GitHub API to squash-merge (avoids the worktree issue where `gh pr merge
 
 ```bash
 # $OWNER, $REPO and $NUM are already set from Step 2b — do not re-type them as literals.
-MERGE_JSON=$(gh api --method PUT "repos/$OWNER/$REPO/pulls/$NUM/merge" -f merge_method=squash 2>&1)
+# -f sha= pins the merge to the commit Steps 2a-2c actually checked. Without it a
+# push landing mid-check merges a commit nothing verified, and GitHub returns 409.
+HEAD_SHA=$(gh pr view "$NUM" --json headRefOid --jq .headRefOid)
+MERGE_JSON=$(gh api --method PUT "repos/$OWNER/$REPO/pulls/$NUM/merge" \
+  -f merge_method=squash -f sha="$HEAD_SHA" 2>&1)
 echo "$MERGE_JSON"
 MERGED=$(printf '%s' "$MERGE_JSON" | jq -r '.merged // false' 2>/dev/null)
 echo "merged=$MERGED"
