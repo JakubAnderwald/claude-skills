@@ -137,7 +137,7 @@ all come back with `ran: true`.
 | result | action |
 |---|---|
 | `reason: "reviewed"` and `posted.inline > 0` | the review opened threads, so **go back to Step 2b**. It will stop on them; tell the user to run `/push` to answer them, then `/merge` again |
-| `reason: "reviewed"` and `coverage` is `cli` | reviewed and clean (findings below thread severity are in its summary comment); go to Step 3 |
+| `reason: "reviewed"` and `coverage` is `cli` or `cli-empty` | reviewed and clean (findings below thread severity are in its summary comment); go to Step 3 |
 | `reason: "bot-covered"`, or `reason: "cli-already-ran"` with `coverage: "cli"` | covered after all; go to Step 3 |
 | `reason: "bot-in-progress"` | the bot started meanwhile, so wait for it (3 below) |
 | anything else (`cli-busy`, `cli-budget`, `cli-paused`, `cli-unavailable`, `cli-rate_limited`, `cli-timeout`, `head-moved`, `post-failed`, `coverage: "cli-partial"`, a non-zero exit) | record `Review: <short sha> merged unreviewed (<reason>, coverage <coverage>)` and go to Step 3 |
