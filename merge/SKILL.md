@@ -130,8 +130,6 @@ node "$GATE" review --pr "$NUM" --repo-root "$ROOT" --timeout-min 30 \
 
 It prints one JSON line: `{ran, reason, outcome, coverage, posted: {inline, …}}`.
 
-| result | action |
-|---|---|
 Match the rows **in order**, on `reason` and `coverage`, never on `ran`. `ran: true` only means
 the vendor was started: a rate limit, timeout, failed post, or a head that moved during the run
 all come back with `ran: true`.
