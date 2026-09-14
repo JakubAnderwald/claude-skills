@@ -9,9 +9,10 @@ user-invocable: true
 
 Follow these steps precisely. This command merges the current branch's PR into main and cleans up so you're ready for the next task.
 
-> **Two things gate the merge, and they are different questions.** *Is every review thread
-> resolved?* (Step 2b) and *has anything reviewed this commit at all?* (Step 2c). A PR with
-> zero unresolved threads because nobody reviewed it passes the first and fails the second.
+> **The merge is gated on review threads, not on review coverage.** Every unresolved thread
+> blocks (Step 2b). When nothing reviewed the head commit, Step 2c gets it a CodeRabbit CLI
+> review if it can. Any threads that review opens block like any others. If no review can run,
+> the merge goes ahead and the user is told. When asked to merge, merge.
 
 ## Step 1: Identify the PR
 
@@ -83,46 +84,93 @@ gh api "repos/$OWNER/$REPO/pulls/$NUM/reviews" --jq '[.[] | select(.state == "CH
 ```
 If any review has `CHANGES_REQUESTED`, inform the user and stop.
 
-### 2c. Check that something has actually reviewed this commit
+### 2c. Get the head commit reviewed if nothing did — then merge regardless
 
-Green CI and zero unresolved threads do **not** mean the code was reviewed. When the reviewer
+Green CI and zero unresolved threads do **not** mean the code was reviewed: when the reviewer
 has not run there are no comments to resolve, so "no complaints" and "approved" look identical.
-That is exactly how a PR merged with four bypasses in it: the check for CodeRabbit had gone
-from `PENDING` to *absent* and absence was read as done. Twenty minutes later the same check
-reported `SUCCESS` while CodeRabbit was rate-limited and had reviewed nothing.
+On repos with the CodeRabbit gate, a hand-made PR's head is often unreviewed because the PR bot
+is rate-limited. This step fills that gap with a CodeRabbit CLI review when it can. **Coverage
+never blocks the merge.** Only threads a review opens do, through Step 2b. When asked to merge,
+merge.
 
-**Neither the check list nor the thread count can answer this.** Ask the repo:
+**1. Ask whether the head is covered:**
 
 ```bash
-# Resolve from the repo root, not the cwd — /merge often runs in a worktree, and
-# a relative path silently breaks the moment you are one directory down.
+# Resolve from the repo root, not the cwd — /merge often runs in a worktree.
 ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
 GATE="$ROOT/scripts/lib/coderabbit-cli.mjs"
 if [[ -n "$ROOT" && -f "$GATE" ]]; then
   COVERAGE=$(node "$GATE" coverage --pr "$NUM" 2>&1); RC=$?
-  printf '%s\nexit=%s\n' "$COVERAGE" "$RC"     # print BOTH: the table below is keyed on the exit code
-elif [[ -n "$ROOT" ]] && git cat-file -e "origin/main:scripts/lib/coderabbit-cli.mjs" 2>/dev/null; then
-  echo "GATE_STALE"   # the gate exists on main but not in this checkout
+  printf '%s\nexit=%s\n' "$COVERAGE" "$RC"
+  grep -q 'case "review"' "$GATE" && echo REVIEW_AVAILABLE
 fi
 ```
 
-| result | what to do |
+| result | action |
 |---|---|
-| `exit=0` (`covered: true`) | **Proceed to Step 3.** Say nothing about it — a covered PR is the normal case, and which reviewer covered it is not the user's problem. |
-| `exit=2` with `"retryable": true` | A review is running. Wait 60s and re-run, up to **15 times** — a real CodeRabbit review takes 10–15 minutes, so a shorter budget just turns the healthy case into a false alarm. **If it then reports covered, go back to Step 2b** before Step 3: the review that just finished may have opened threads. |
-| `exit=2` otherwise | **STOP.** Print `.reason` and the short head SHA. |
-| any other exit | **STOP.** The gate could not answer — say so. Do not treat "could not check" as "fine"; that is the same fail-open mistake in a new place. |
-| `GATE_STALE` | **STOP.** This branch predates the gate, so it cannot check itself. Say so and offer to rebase onto `main`. Skipping here would silently disarm the check on exactly the older PRs most likely to need it. |
-| neither printed | The repo has no gate — skip this step. |
+| no gate in the repo | skip this step |
+| `exit=0` (`covered: true`) | go to Step 3; nothing to report |
+| `exit=2` with `"retryable": true` | the bot is reviewing right now, so wait for it (3 below) |
+| `exit=2` otherwise, and `REVIEW_AVAILABLE` printed | run the CLI review (2 below) |
+| `exit=2` otherwise, without `REVIEW_AVAILABLE` | record `Review: <short sha> merged unreviewed (<.reason>)` and go to Step 3 |
+| any other exit | record `Review: coverage unknown — the gate could not answer` and go to Step 3 |
 
-When you stop, the user may reply "merge anyway" — then continue to Step 3. The point is that
-skipping the reviewer becomes a decision someone makes, not something that happens quietly.
+**2. Run the CLI review.** It takes minutes, longer than a foreground shell call may run, so
+start it with the Bash tool's `run_in_background: true` and wait for the completion
+notification. Don't poll or sleep. Tell the user in one line that a CodeRabbit CLI review of the
+head is running (up to 30 min) and that they can say "skip" to merge without it. On the Mac
+mini, pass the factory's state file so the run shares the factory's CLI budget and never
+collides with a factory run:
 
-Do not improvise a replacement check when the gate is unavailable. Deciding whether a review
-covers a commit is subtler than it looks — a bot review's `commit_id` says nothing about what
-it reviewed, an empty-bodied "review" is a thread reply, and a run whose findings failed to
-parse renders identically to a clean one. Getting any of those wrong reports the opposite of
-the truth.
+```bash
+STATE="${DRAFTO_FACTORY_STATE_FILE:-$HOME/code/drafto-factory/logs/factory-state.json}"
+node "$GATE" review --pr "$NUM" --repo-root "$ROOT" --timeout-min 30 \
+  $( [[ -f "$STATE" ]] && printf -- '--state-file %s' "$STATE" )
+```
+
+It prints one JSON line: `{ran, reason, outcome, coverage, posted: {inline, …}}`.
+
+| result | action |
+|---|---|
+Match the rows **in order**, on `reason` and `coverage`, never on `ran`. `ran: true` only means
+the vendor was started: a rate limit, timeout, failed post, or a head that moved during the run
+all come back with `ran: true`.
+
+| result | action |
+|---|---|
+| `reason: "reviewed"` and `posted.inline > 0` | the review opened threads, so **go back to Step 2b**. It will stop on them; tell the user to run `/push` to answer them, then `/merge` again |
+| `reason: "reviewed"` and `coverage` is `cli` | reviewed and clean (findings below thread severity are in its summary comment); go to Step 3 |
+| `reason: "bot-covered"`, or `reason: "cli-already-ran"` with `coverage: "cli"` | covered after all; go to Step 3 |
+| `reason: "bot-in-progress"` | the bot started meanwhile, so wait for it (3 below) |
+| anything else (`cli-busy`, `cli-budget`, `cli-paused`, `cli-unavailable`, `cli-rate_limited`, `cli-timeout`, `head-moved`, `post-failed`, `coverage: "cli-partial"`, a non-zero exit) | record `Review: <short sha> merged unreviewed (<reason>, coverage <coverage>)` and go to Step 3 |
+
+If the user says "skip" while it runs, stop the background task (TaskStop), record `Review:
+<short sha> merged unreviewed (review skipped by user)`, and go to Step 3. On a stop signal
+`review` kills its CLI child and frees the factory's slot itself.
+
+**3. Wait for a PR-bot review that is already running.** A CodeRabbit review takes 10–15
+minutes, and the threads it opens must block like any other, so don't merge under it. Run this
+loop with `run_in_background: true`, tell the user in one line that it's waiting (they can say
+"skip"), and wait for the completion notification:
+
+```bash
+for i in $(seq 1 20); do
+  OUT=$(node "$GATE" coverage --pr "$NUM" 2>&1); RC=$?
+  [[ $RC -ne 2 ]] || ! printf '%s' "$OUT" | grep -q '"retryable":true' && break
+  sleep 60
+done
+printf '%s\nexit=%s\n' "$OUT" "$RC"
+```
+
+- `exit=0`: the review finished. **Go back to Step 2b**, since it may have opened threads.
+- Still `retryable` after 20 minutes, or the user says "skip": record `Review: CodeRabbit was
+  still reviewing <short sha> at merge time` and go to Step 3.
+- Anything else (the bot hit its rate limit meanwhile): go back to the first table and take
+  the row for this result.
+
+Do not improvise a replacement coverage check. Deciding whether a review covers a commit is
+subtler than it looks (a bot review's `commit_id` says nothing about what it reviewed), and a
+wrong answer reports the opposite of the truth.
 
 ## Step 3: Merge the PR
 
@@ -219,4 +267,5 @@ Print a summary:
 - Branch deleted (remote and local)
 - Worktree removed (if applicable)
 - Current state: on `main`, up to date
+- The Step 2c coverage line, if one was recorded (e.g. merged unreviewed and why)
 - **Ready to start a new task** — suggest the user run `/clear` to reset context
